@@ -1,0 +1,353 @@
+# Название workflow — так он отображается во вкладке Actions на GitHub
+name: Build containers
+
+# События, при которых запускается этот workflow
+on:
+  # Заливка в любую ветку: собираем образ и публикуем в GitHub Container Registry
+  push:
+    branches:
+      - '**'
+  # Pull request: проверяем сборку без push; после merge удаляем образы исходной ветки
+  pull_request:
+    # opened — PR только что создан
+    # synchronize — в PR запушили новые коммиты
+    # reopened — закрытый PR открыли снова
+    # closed — PR закрыт (при merge чистим registry)
+    types: [opened, synchronize, reopened, closed]
+  # Удаление ветки: чистим образы этой ветки в registry (как после merge PR)
+  delete:
+
+# contents:read — checkout репозитория
+# packages:write — публикация и удаление образов в GitHub Container Registry (ghcr.io)
+permissions:
+  contents: read
+  packages: write
+
+# Список задач (jobs), которые выполняются в этом workflow
+jobs:
+  # Сканируем корень репозитория: каждый каталог php-* — отдельный образ.
+  # Так не нужно править workflow при добавлении или удалении образов.
+  discover:
+    # Сборка только на push и на открытых PR; closed PR и delete обрабатывает job cleanup
+    if: github.event_name == 'push' || (github.event_name == 'pull_request' && github.event.action != 'closed')
+    name: Discover images
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      matrix: ${{ steps.set-matrix.outputs.matrix }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Collect php-* image directories
+        id: set-matrix
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+
+          images=()
+          for dir in php-*/; do
+            name="${dir%/}"
+            if [[ -d "$name" ]]; then
+              images+=("$name")
+            fi
+          done
+
+          if [[ ${#images[@]} -eq 0 ]]; then
+            echo "Не найдены каталоги образов, имя которых начинается с php-"
+            exit 1
+          fi
+
+          mapfile -t images < <(printf '%s\n' "${images[@]}" | sort)
+
+          echo "Найдены образы:"
+          printf '  - %s\n' "${images[@]}"
+
+          matrix="$(
+            printf '%s\n' "${images[@]}" | jq -R -s -c '
+              {
+                include: split("\n")
+                  | map(select(length > 0))
+                  | map({image: ., platforms: "linux/amd64,linux/arm64"})
+              }
+            '
+          )"
+
+          echo "matrix=$matrix" >> "$GITHUB_OUTPUT"
+          echo "Матрица: $matrix"
+
+  # Идентификатор задачи — используется во внутренних ссылках workflow
+  build:
+    needs: discover
+    # Имя job в UI GitHub; ${{ matrix.image }} подставляет текущий образ из матрицы
+    name: Build ${{ matrix.image }}
+    # ОС раннера GitHub: свежий Ubuntu, на нём есть Docker
+    runs-on: ubuntu-latest
+    # Multi-arch (QEMU) сборка PHP-расширений дольше обычной
+    timeout-minutes: 120
+    # Как запускать несколько вариантов одной и той же job
+    strategy:
+      # false: падение одного образа не отменяет сборку второго
+      fail-fast: false
+      # Матрица собирается job discover из каталогов php-*
+      matrix: ${{ fromJSON(needs.discover.outputs.matrix) }}
+    env:
+      # Адрес GitHub Container Registry
+      REGISTRY: ghcr.io
+      # Имя пакета совпадает с репозиторием: owner/repo
+      IMAGE_NAME: ${{ github.repository }}
+      # Публикуем любой push в ветку; в PR только проверяем, что образ собирается
+      PUSH_IMAGE: ${{ github.event_name == 'push' }}
+    # Последовательные шаги внутри job
+    steps:
+      # Человекочитаемое имя шага в логах Actions
+      - name: Checkout
+        # Официальный action: клонирует репозиторий на раннер
+        uses: actions/checkout@v5
+        with:
+          # Полная история нужна, чтобы собрать описание изменений между коммитами
+          fetch-depth: 0
+
+      - name: Collect changelog
+        id: changelog
+        # Собираем список сообщений коммитов для описания образа в GHCR (до 512 символов)
+        run: |
+          set -euo pipefail
+
+          before="${{ github.event.before }}"
+          empty_sha="0000000000000000000000000000000000000000"
+
+          if [[ "${{ github.event_name }}" == "push" && -n "$before" && "$before" != "$empty_sha" ]] \
+            && git cat-file -e "${before}^{commit}" 2>/dev/null; then
+            log="$(git log --reverse --pretty=format:'%s' "${before}..${{ github.sha }}")"
+          else
+            log="$(git log -1 --pretty=format:'%s')"
+          fi
+
+          # Одна строка без переносов: GHCR показывает description как обычный текст
+          description="$(printf '%s' "$log" | tr '\n' '; ' | tr -d '\r' | head -c 500)"
+          if [[ -z "${description// }" ]]; then
+            description="WordPress ${{ matrix.image }}"
+          fi
+
+          {
+            echo "description<<EOF"
+            echo "$description"
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+
+          echo "Описание образа: $description"
+
+      - name: Log in to GitHub Container Registry
+        # Логин нужен только перед публикацией; в PR этот шаг пропускается
+        if: env.PUSH_IMAGE == 'true'
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Set up QEMU
+        # Эмуляция чужих архитектур на ubuntu-latest (amd64) для multi-arch сборки
+        uses: docker/setup-qemu-action@v3
+        with:
+          platforms: arm64
+
+      - name: Set up Docker Buildx
+        # Подключает Buildx — современный сборщик Docker с кэшем, BuildKit и manifest list
+        uses: docker/setup-buildx-action@v3
+
+      - name: Docker metadata
+        id: meta
+        # Теги и OCI-метаданные: описание изменений попадёт на страницу пакета в GHCR
+        # Default branch: php-8.3-fpm-bookworm и php-8.3-fpm-bookworm-<sha>
+        # Остальные ветки: php-8.3-fpm-bookworm-<branch> и php-8.3-fpm-bookworm-<branch>-<sha>
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          flavor: |
+            latest=false
+          tags: |
+            type=raw,value=${{ matrix.image }},enable={{is_default_branch}}
+            type=sha,prefix=${{ matrix.image }}-,format=short,enable={{is_default_branch}}
+            type=ref,event=branch,prefix=${{ matrix.image }}-,enable={{is_not_default_branch}}
+            type=sha,prefix=${{ matrix.image }}-{{branch}}-,format=short,enable=${{ github.event_name == 'push' && github.ref != format('refs/heads/{0}', github.event.repository.default_branch) }}
+            type=ref,event=pr,prefix=${{ matrix.image }}-
+          labels: |
+            org.opencontainers.image.title=wordpress ${{ matrix.image }}
+            org.opencontainers.image.description=${{ steps.changelog.outputs.description }}
+            org.opencontainers.image.licenses=MIT
+          annotations: |
+            org.opencontainers.image.description=${{ steps.changelog.outputs.description }}
+            org.opencontainers.image.licenses=MIT
+
+      - name: Build image
+        # Сборка образа; push включается для любой ветки, но не для PR
+        uses: docker/build-push-action@v6
+        with:
+          # Контекст сборки: каталог образа (COPY берёт файлы отсюда)
+          context: ./${{ matrix.image }}
+          # Путь к Dockerfile внутри этого каталога
+          file: ./${{ matrix.image }}/Dockerfile
+          # Несколько платформ → Buildx собирает manifest list (один тег, несколько архитектур)
+          platforms: ${{ matrix.platforms }}
+          # true на push — публикуем в ghcr.io; false на PR — только проверка сборки
+          push: ${{ env.PUSH_IMAGE == 'true' }}
+          # Теги зависят от ветки: стабильные на default, с суффиксом ветки на остальных
+          tags: ${{ steps.meta.outputs.tags }}
+          # OCI-labels: title, description (changelog), license
+          labels: ${{ steps.meta.outputs.labels }}
+          # Аннотации манифеста — GHCR читает из них description пакета
+          annotations: ${{ steps.meta.outputs.annotations }}
+          # Без provenance/SBOM-attestations: иначе GHCR добавляет лишние манифесты рядом с index
+          provenance: false
+          sbom: false
+          # Читать кэш слоёв из GitHub Actions Cache, отдельно для каждого образа (scope)
+          cache-from: type=gha,scope=${{ matrix.image }}
+          # Писать кэш слоёв обратно в GHA (mode=max — все промежуточные слои)
+          cache-to: type=gha,mode=max,scope=${{ matrix.image }}
+
+      - name: Publish summary
+        if: env.PUSH_IMAGE == 'true'
+        run: |
+          {
+            echo "### Опубликованы теги"
+            echo
+            echo '```'
+            echo "${{ steps.meta.outputs.tags }}"
+            echo '```'
+            echo
+            echo "**Платформы:** \`${{ matrix.platforms }}\`"
+            echo
+            echo "**Изменения:** ${{ steps.changelog.outputs.description }}"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  # После merge PR или удаления ветки удаляем из registry все теги этой (не default) ветки
+  cleanup:
+    name: Delete branch images
+    if: >
+      (github.event_name == 'pull_request' && github.event.action == 'closed' && github.event.pull_request.merged)
+      || (github.event_name == 'delete' && github.event.ref_type == 'branch')
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      OWNER: ${{ github.repository_owner }}
+      OWNER_TYPE: ${{ github.event.repository.owner.type }}
+      PACKAGE: ${{ github.event.repository.name }}
+      # delete: github.event.ref — короткое имя ветки; PR: head.ref исходной ветки
+      HEAD_BRANCH: ${{ github.event_name == 'delete' && github.event.ref || github.event.pull_request.head.ref }}
+      DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Delete branch tags from GitHub Container Registry
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+
+          if [[ "$HEAD_BRANCH" == "$DEFAULT_BRANCH" ]]; then
+            echo "Ветка — default ($DEFAULT_BRANCH), стабильные теги не удаляем."
+            exit 0
+          fi
+
+          # Та же нормализация, что у docker/metadata-action: недопустимые символы → дефис
+          sanitize() {
+            printf '%s' "$1" | sed -E 's/[^a-zA-Z0-9._-]+/-/g'
+          }
+
+          branch_slug="$(sanitize "$HEAD_BRANCH")"
+          if [[ -z "$branch_slug" ]]; then
+            echo "Не удалось нормализовать имя ветки: $HEAD_BRANCH"
+            exit 0
+          fi
+
+          # Те же каталоги php-*, что собирает job discover / build
+          images=()
+          for dir in php-*/; do
+            name="${dir%/}"
+            if [[ -d "$name" ]]; then
+              images+=("$name")
+            fi
+          done
+
+          if [[ ${#images[@]} -eq 0 ]]; then
+            echo "Каталоги php-* не найдены — удалять нечего."
+            exit 0
+          fi
+
+          mapfile -t images < <(printf '%s\n' "${images[@]}" | sort)
+          echo "Образы для очистки: ${images[*]}"
+
+          package_lower="$(printf '%s' "$PACKAGE" | tr '[:upper:]' '[:lower:]')"
+          package_enc="$(printf '%s' "$package_lower" | jq -sRr @uri | sed 's/%0A$//')"
+
+          if [[ "$OWNER_TYPE" == "Organization" ]]; then
+            versions_api="/orgs/${OWNER}/packages/container/${package_enc}/versions"
+          else
+            versions_api="/users/${OWNER}/packages/container/${package_enc}/versions"
+          fi
+
+          echo "Ищем теги ветки '${HEAD_BRANCH}' (slug: ${branch_slug}) в ${versions_api}"
+
+          ids="$(
+            gh api --paginate "$versions_api" \
+              --jq '.[] | {id: .id, tags: (.metadata.container.tags // [])}' \
+            | jq -r --arg slug "$branch_slug" --arg imgs "${images[*]}" '
+                .id as $id
+                | .tags[]? as $tag
+                | ($imgs | split(" "))[] as $image
+                | select(
+                    $tag == ($image + "-" + $slug)
+                    or ($tag | startswith($image + "-" + $slug + "-"))
+                  )
+                | $id
+              ' | sort -u
+          )"
+
+          if [[ -z "$ids" ]]; then
+            echo "Теги ветки не найдены — удалять нечего."
+            {
+              echo "### Очистка registry"
+              echo
+              echo "Теги ветки \`$HEAD_BRANCH\` не найдены."
+            } >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+
+          deleted=0
+          failed=0
+          while IFS= read -r id; do
+            [[ -z "$id" ]] && continue
+            echo "Удаляю версию пакета $id"
+            code="$(
+              curl -sS -o /tmp/ghcr-del.out -w "%{http_code}" -X DELETE \
+                -H "Authorization: Bearer ${GH_TOKEN}" \
+                -H "Accept: application/vnd.github+json" \
+                -H "X-GitHub-Api-Version: 2022-11-28" \
+                "https://api.github.com${versions_api}/${id}"
+            )"
+            if [[ "$code" == "204" || "$code" == "404" ]]; then
+              deleted=$((deleted + 1))
+            else
+              echo "Не удалось удалить $id: HTTP $code"
+              cat /tmp/ghcr-del.out || true
+              failed=$((failed + 1))
+            fi
+          done <<< "$ids"
+
+          {
+            echo "### Очистка registry"
+            echo
+            echo "Ветка: \`$HEAD_BRANCH\`"
+            echo
+            echo "Удалено версий: **$deleted**"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          if [[ "$failed" -gt 0 ]]; then
+            echo "Не удалось удалить версий: $failed"
+            exit 1
+          fi
+
+          echo "Удалено версий: $deleted"

@@ -1,0 +1,16 @@
+.idea
+.DS_Store
+
+.env
+.env.local
+.env.local.php
+.env.*.local
+
+/vendor
+/node_modules
+/public
+/wp-config.php
+/debug.log
+
+*.log
+*.pid

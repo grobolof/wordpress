@@ -1,0 +1,35 @@
+services:
+
+  application:
+    image: ghcr.io/grobolof/wordpress:php-8.5-fpm-trixie
+    env_file: .env
+    working_dir: ${APP_PATH}
+    environment:
+      PHP_IDE_CONFIG: serverName=${APP_HOST}
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    ports:
+      - "80:80"
+    volumes:
+      - ./:${APP_PATH}
+    depends_on:
+      - database
+
+  database:
+    image: mariadb:11.8
+    environment:
+      MARIADB_DATABASE: ${DB_DATABASE}
+      MARIADB_USER: ${DB_USERNAME}
+      MARIADB_PASSWORD: ${DB_PASSWORD}
+      MARIADB_ROOT_PASSWORD: ${DB_PASSWORD}
+    ports:
+      - "3306:3306"
+    volumes:
+      - ./docker/mariadb/db.sql:/docker-entrypoint-initdb.d/db.sql
+
+  mailpit:
+    image: axllent/mailpit
+    hostname: mailpit
+    ports:
+      - "8025:8025"
+      - "1025:1025"

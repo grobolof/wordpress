@@ -1,0 +1,12 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="400" height="122" viewBox="0 0 400 122">
+    <style>
+        .wp-mark { fill: #21759b; }
+        .wp-word { fill: #21759b; }
+        @media (prefers-color-scheme: dark) {
+            .wp-word { fill: #fff; }
+        }
+    </style>
+    <circle class="wp-mark" cx="61" cy="61" r="52"/>
+    <text x="61" y="80" text-anchor="middle" fill="#ffffff" font-family="Georgia, 'Times New Roman', serif" font-size="72" font-weight="700">W</text>
+    <text class="wp-word" x="130" y="76" font-family="Georgia, 'Times New Roman', serif" font-size="42" font-weight="700">WordPress</text>
+</svg>
